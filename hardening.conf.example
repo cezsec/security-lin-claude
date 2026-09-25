@@ -1,0 +1,42 @@
+# Settings for harden.sh. Use with:  sudo ./harden.sh --config hardening.conf
+# Options given on the command line override this file.
+# Format: KEY=VALUE, one per line. Lines starting with # are ignored.
+
+# baseline (safe for multi-user web servers) or strict (CIS Level 2-style)
+PROFILE=baseline
+
+# Areas to leave alone, comma-separated:
+# updates,firewall,ssh,fail2ban,kernel,filesystem,accounts,logging,apparmor,time,web,tools
+SKIP_AREAS=
+
+# Public ports the firewall must keep open (SSH is always allowed).
+ALLOW_TCP=80,443
+ALLOW_UDP=
+# 1 = also allow every port a service already listens on (never databases)
+ALLOW_DETECTED=0
+
+# SSH. Leave SSH_PORT empty to keep the current port.
+SSH_PORT=
+SSH_CLOSE_OLD_PORT=0
+# auto: turn off passwords only once every login user has a key
+SSH_PASSWORD_AUTH=auto
+# Restrict SSH to these networks (comma-separated). Empty = from anywhere.
+SSH_ALLOW_FROM=
+SSH_BANNER=0
+
+# Addresses fail2ban must never ban (your office or VPN egress IPs).
+ADMIN_IPS=
+
+# Optional components
+WITH_AIDE=0
+WITH_CLAMAV=0
+RUN_LYNIS=0
+# HH:MM to let unattended-upgrades reboot when an update requires it
+AUTO_REBOOT_TIME=
+
+# Exit with code 5 when a finding at or above this severity remains
+# (critical, high, medium, low). Empty = always exit 0 on success.
+FAIL_ON=
+
+REPORT_ROOT=/var/log/ubuntu-hardening
+BACKUP_ROOT=/var/backups/ubuntu-hardening
