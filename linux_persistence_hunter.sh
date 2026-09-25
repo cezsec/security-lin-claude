@@ -139,7 +139,9 @@ add_finding() {
 
 is_elf() {
     [ -f "$1" ] && [ -r "$1" ] || return 1
-    [ "$(head -c 4 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]
+    local magic=""
+    read -r -N 4 magic 2>/dev/null < "$1"
+    [ "$magic" = $'\x7fELF' ]
 }
 
 recent() { [ -n "$(find "$1" -maxdepth 0 -mtime "-$DAYS" 2>/dev/null)" ]; }
@@ -162,7 +164,7 @@ PKG=none
 if [ -d "$R/var/lib/dpkg/info" ]; then
     PKG=dpkg
     cat "$R"/var/lib/dpkg/info/*.list 2>/dev/null | sort -u > "$OWNED"
-elif command -v rpm >/dev/null 2>&1 && [ -d "$R/var/lib/rpm" -o -d "$R/usr/lib/sysimage/rpm" ]; then
+elif command -v rpm >/dev/null 2>&1 && { [ -d "$R/var/lib/rpm" ] || [ -d "$R/usr/lib/sysimage/rpm" ]; }; then
     PKG=rpm
     if [ "$LIVE" -eq 1 ]; then
         rpm -qa --qf '[%{FILENAMES}\n]' 2>/dev/null | sort -u > "$OWNED"
@@ -172,22 +174,29 @@ elif command -v rpm >/dev/null 2>&1 && [ -d "$R/var/lib/rpm" -o -d "$R/usr/lib/s
 fi
 [ -s "$OWNED" ] || PKG=none
 
+# Owned paths as a hash, so a lookup costs no process (a grep of the list
+# per file made the systemd and SUID checks slow).
+declare -A OWNED_SET=()
+if [ "$PKG" != none ]; then
+    while IFS= read -r _p; do [ -n "$_p" ] && OWNED_SET[$_p]=1; done < "$OWNED"
+    unset _p
+fi
+
 # is_owned /path (display path, without R prefix). Handles usr-merge aliases.
 is_owned() {
     [ "$PKG" = none ] && return 0
-    local p="$1" c
+    local p="$1" c=""
+    [ -n "$p" ] || return 1
     case "$p" in /snap/*|/var/lib/snapd/snap/*) return 0 ;; esac   # read-only squashfs managed by snapd
-    local cands=("$p")
+    [ -n "${OWNED_SET[$p]+x}" ] && return 0
     case "$p" in
-        /usr/bin/*|/usr/sbin/*|/usr/lib/*|/usr/lib64/*|/usr/lib32/*) cands+=("${p#/usr}") ;;
-        /bin/*|/sbin/*|/lib/*|/lib64/*|/lib32/*) cands+=("/usr$p") ;;
+        /usr/bin/*|/usr/sbin/*|/usr/lib/*|/usr/lib64/*|/usr/lib32/*) c="${p#/usr}" ;;
+        /bin/*|/sbin/*|/lib/*|/lib64/*|/lib32/*) c="/usr$p" ;;
     esac
+    [ -n "$c" ] && [ -n "${OWNED_SET[$c]+x}" ] && return 0
     if [ "$LIVE" -eq 1 ]; then
-        c="$(readlink -f "$p" 2>/dev/null)" && [ -n "$c" ] && cands+=("$c")
+        c="$(readlink -f "$p" 2>/dev/null)" && [ -n "$c" ] && [ -n "${OWNED_SET[$c]+x}" ] && return 0
     fi
-    for c in "${cands[@]}"; do
-        grep -Fxq -- "$c" "$OWNED" && return 0
-    done
     return 1
 }
 
@@ -283,8 +292,8 @@ done
 if [ "$LIVE" -eq 1 ]; then
     for env in /proc/[0-9]*/environ; do
         pid="${env#/proc/}"; pid="${pid%%/*}"
-        v="$(tr '\0' '\n' < "$env" 2>/dev/null | grep -E '^LD_(PRELOAD|AUDIT)=' | head -1)"
-        [ -n "$v" ] && add_finding HIGH PROCESS "pid $pid ($(cat /proc/$pid/comm 2>/dev/null))" "Process runs with $v"
+        v="$(tr '\0' '\n' 2>/dev/null < "$env" | grep -E '^LD_(PRELOAD|AUDIT)=' | head -1)"
+        [ -n "$v" ] && add_finding HIGH PROCESS "pid $pid ($(cat "/proc/$pid/comm" 2>/dev/null))" "Process runs with $v"
     done
 fi
 
@@ -362,6 +371,7 @@ for h in "${HOMES[@]}"; do
         case "$ak" in *authorized_keys2) add_finding MEDIUM SSH-KEYS "$(disp "$ak")" "Legacy authorized_keys2 file in use (often overlooked by admins)" ;; esac
         recent "$ak" && add_finding MEDIUM SSH-KEYS "$(disp "$ak")" "Modified within last $DAYS days ($(mtime "$ak"))"
     done
+    # shellcheck disable=SC2088  # literal "~/.ssh/rc" is the message text
     [ -f "$h/.ssh/rc" ] && add_finding HIGH SSH-KEYS "$(disp "$h")/.ssh/rc" "~/.ssh/rc executes on every SSH login"
     [ -f "$h/.ssh/rc" ] && scan_paths SSH-KEYS --exec "$h/.ssh/rc"
 done
@@ -401,14 +411,14 @@ scan_paths SYSTEMD --exec "${SYS_ETC_DIRS[@]}" "${SYS_PKG_DIRS[@]}" "${USER_UNIT
 unit_exec() { grep -hE '^[[:space:]]*Exec(Start|StartPre|StartPost|Stop|Reload)=' "$1" 2>/dev/null | head -2 | tr '\n' ' '; }
 
 while IFS= read -r -d '' u; do
-    d="$(disp "$u")"
-    case "$(basename "$u")" in .*) add_finding HIGH SYSTEMD "$d" "Hidden unit file name" ;; esac
+    d="${u#"$R"}"; b="${u##*/}"   # same as disp/basename, without a subshell per unit
+    case "$b" in .*) add_finding HIGH SYSTEMD "$d" "Hidden unit file name" ;; esac
     is_owned "$d" && continue
     case "$d" in
         /etc/systemd/system/*|/etc/systemd/user/*|/usr/local/*|/run/*) sev=MEDIUM ;;
         *) sev=HIGH ;;  # unowned file inside a package-managed dir
     esac
-    case "$(basename "$u")" in snap.*|snap-*) sev=LOW ;; esac
+    case "$b" in snap.*|snap-*) sev=LOW ;; esac
     [ "$PKG" = none ] && continue
     add_finding "$sev" SYSTEMD "$d" "Unit not owned by any package (modified $(mtime "$u")): $(unit_exec "$u")"
 done < <(find "${SYS_ETC_DIRS[@]}" "${SYS_PKG_DIRS[@]}" -type f \( -name '*.service' -o -name '*.timer' -o -name '*.socket' -o -name '*.path' \) -print0 2>/dev/null)
@@ -592,8 +602,14 @@ if [ "$QUICK" -eq 0 ]; then
     section "PACKAGE INTEGRITY (this can take a few minutes)"
     VERIFY_OUT="$OUTDIR/.verify"
     if [ "$PKG" = dpkg ] && command -v dpkg >/dev/null 2>&1; then
-        if [ "$LIVE" -eq 1 ]; then $TIMEOUT dpkg --verify > "$VERIFY_OUT" 2>/dev/null
-        else $TIMEOUT dpkg --root="$R" --verify > "$VERIFY_OUT" 2>/dev/null; fi
+        # Verifying packages in parallel batches is about twice as fast as one
+        # "dpkg --verify" and prints the same lines. Capped at 4 jobs so a
+        # spinning disk is not thrashed.
+        JOBS="$(nproc 2>/dev/null || echo 1)"; [ "$JOBS" -gt 4 ] && JOBS=4
+        DPKG_ROOT=(); [ "$LIVE" -eq 0 ] && DPKG_ROOT=(--root="$R")
+        dpkg-query "${DPKG_ROOT[@]}" -W -f '${db:Status-Abbrev} ${binary:Package}\n' 2>/dev/null \
+            | awk '$1 ~ /^.[^nc]/ { print $2 }' \
+            | $TIMEOUT xargs -r -P "$JOBS" -n 16 dpkg "${DPKG_ROOT[@]}" --verify > "$VERIFY_OUT" 2>/dev/null
     elif [ "$PKG" = rpm ]; then
         if [ "$LIVE" -eq 1 ]; then $TIMEOUT rpm -Va --nomtime > "$VERIFY_OUT" 2>/dev/null
         else $TIMEOUT rpm --root "$R" -Va --nomtime > "$VERIFY_OUT" 2>/dev/null; fi
@@ -607,6 +623,8 @@ if [ "$QUICK" -eq 0 ]; then
             done
     fi
     rm -f "$VERIFY_OUT"
+    [ "$PKG" != none ] && add_finding INFO COVERAGE "package database" \
+        "Package checksums come from $([ "$LIVE" -eq 1 ] && echo "this host's" || echo "the image's") own package database, which an attacker with root can rewrite - a clean result is not proof; verify against packages from a trusted mirror"
 fi
 
 # ============================================================================
@@ -623,7 +641,7 @@ if [ "$LIVE" -eq 1 ]; then
         exe="$(readlink "$pd/exe" 2>/dev/null)" || continue      # kernel threads / no permission
         [ -z "$exe" ] && continue
         comm="$(cat "$pd/comm" 2>/dev/null)"
-        cmd="$(tr '\0' ' ' < "$pd/cmdline" 2>/dev/null)"; cmd="${cmd:0:250}"
+        cmd="$(tr '\0' ' ' 2>/dev/null < "$pd/cmdline")"; cmd="${cmd:0:250}"
         ppid="$(awk '/^PPid:/{print $2}' "$pd/status" 2>/dev/null)"
         who="pid $pid ($comm, ppid $ppid)"
 
@@ -693,9 +711,10 @@ if [ "$QUICK" -eq 1 ]; then
 else
     SUID_SCOPE=("$R/")
 fi
+SUID_FILES=()
 while IFS= read -r -d '' f; do
-    d="$(disp "$f")"; b="$(basename "$f")"
-    printf '%s\n' "$(ls -la "$f" 2>/dev/null)" >> "$EVIDENCE"
+    d="${f#"$R"}"; b="${f##*/}"
+    SUID_FILES+=("$f")
     case "$d" in
         /tmp/*|/var/tmp/*|/dev/shm/*|/home/*|/root/*|/run/*)
             add_finding CRITICAL SUID "$d" "SUID/SGID file in user-writable location (owner $(stat -c %U "$f"))" ; continue ;;
@@ -706,6 +725,8 @@ while IFS= read -r -d '' f; do
         add_finding HIGH SUID "$d" "SUID/SGID file not owned by any package (modified $(mtime "$f"))"
     fi
 done < <(find "${SUID_SCOPE[@]}" -xdev -type f \( -perm -4000 -o -perm -2000 \) -print0 2>/dev/null)
+# One ls for the whole list instead of one per file
+[ ${#SUID_FILES[@]} -gt 0 ] && printf '%s\0' "${SUID_FILES[@]}" | xargs -0 ls -la -- >> "$EVIDENCE" 2>/dev/null
 
 if command -v getcap >/dev/null 2>&1; then
     CAPS_SCOPE=("$R/usr" "$R/bin" "$R/sbin" "$R/opt" "$R/home" "$R/root" "$R/tmp" "$R/var/tmp")
@@ -780,22 +801,27 @@ if [ ${#EX[@]} -gt 0 ]; then
     done
 fi
 
-evidence "Files modified in last 24h (/etc /usr/local /opt /home /root /var excl. logs/caches)" \
-    bash -c "find '$R/etc' '$R/usr/local' '$R/opt' '$R/home' '$R/root' '$R/var' -xdev -type f -mmin -1440 \
+# Paths are passed as arguments, never pasted into a shell string, so an
+# image path containing quotes cannot break or inject into the command.
+# recent_files FIND_AGE_TEST...  (e.g. -mmin -1440)
+recent_files() {
+    find "$R/etc" "$R/usr/local" "$R/opt" "$R/home" "$R/root" "$R/var" -xdev -type f "$@" \
         -not -path '*/var/log/*' -not -path '*/var/cache/*' -not -path '*/var/lib/docker/*' -not -path '*/.cache/*' \
-        -printf '%TY-%Tm-%Td %TH:%TM %p\n' 2>/dev/null | sort -r | head -500"
-evidence "Files modified in last $DAYS days (same scope)" \
-    bash -c "find '$R/etc' '$R/usr/local' '$R/opt' '$R/home' '$R/root' '$R/var' -xdev -type f -mtime -$DAYS \
-        -not -path '*/var/log/*' -not -path '*/var/cache/*' -not -path '*/var/lib/docker/*' -not -path '*/.cache/*' \
-        -printf '%TY-%Tm-%Td %TH:%TM %p\n' 2>/dev/null | sort -r | head -500"
+        -printf '%TY-%Tm-%Td %TH:%TM %p\n' 2>/dev/null | sort -r | head -500
+}
+evidence "Files modified in last 24h (/etc /usr/local /opt /home /root /var excl. logs/caches)" recent_files -mmin -1440
+evidence "Files modified in last $DAYS days (same scope)" recent_files -mtime "-$DAYS"
 if [ -f "$R/var/log/dpkg.log" ]; then
-    evidence "Recent package installs (dpkg)" bash -c "grep ' install ' '$R/var/log/dpkg.log' | tail -100"
+    dpkg_installs() { grep ' install ' "$R/var/log/dpkg.log" | tail -100; }
+    evidence "Recent package installs (dpkg)" dpkg_installs
 fi
 if [ "$PKG" = rpm ] && [ "$LIVE" -eq 1 ]; then
-    evidence "Recent package installs (rpm)" bash -c "rpm -qa --last | head -100"
+    rpm_installs() { rpm -qa --last | head -100; }
+    evidence "Recent package installs (rpm)" rpm_installs
 fi
 if [ "$LIVE" -eq 1 ]; then
-    evidence "Last logins" bash -c "last -Faiw 2>/dev/null | head -50"
+    last_logins() { last -Faiw 2>/dev/null | head -50; }
+    evidence "Last logins" last_logins
     evidence "Currently logged in" who -a
 fi
 
@@ -844,7 +870,7 @@ recommend() {
         HISTORY)       echo "Build a timeline around the listed commands; correlate with auth logs (journalctl -u ssh, /var/log/auth.log or secure) and last/lastb. Disabled history indicates an attacker covering tracks." ;;
         PYTHON-PTH)    echo ".pth files run on every Python start. Remove code-executing .pth files not shipped by a known package and check who wrote them." ;;
         RECENT-CHANGE) echo "Correlate modification times with logins and package logs; any change not explained by admin activity or updates should be reviewed." ;;
-        COVERAGE)      echo "Re-run as root on the live host (or with the package database available) for full coverage." ;;
+        COVERAGE)      echo "Re-run as root on the live host (or with the package database available) for full coverage. A clean package check only means files match the local checksum database; for certainty compare against packages from a trusted mirror or rescue media." ;;
         *)             echo "Review manually." ;;
     esac
 }

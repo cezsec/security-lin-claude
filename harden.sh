@@ -1214,9 +1214,7 @@ audit_web() {
     if [[ $found -eq 0 ]]; then info WEB-000 "No web server detected"; fi
     if [[ -d /var/www || -d /srv ]]; then
         local ww
-        if [[ -z ${SCAN_CACHE[webww]+x} ]]; then
-            SCAN_CACHE[webww]=$(timeout 60 find /var/www /srv -xdev -type f -perm -0002 2>/dev/null | head -21) || true
-        fi
+        scan_filesystem
         ww=${SCAN_CACHE[webww]}
         if [[ -z $ww ]]; then
             pass high WEB-030 "No world-writable files under /var/www or /srv"
@@ -1356,6 +1354,42 @@ critical_path_items() {
     for k in /etc/ssh/ssh_host_*_key; do printf '%s|600|root|root|high\n' "$k"; done
 }
 
+# One walk per file system collects world-writable directories without the
+# sticky bit, unowned files (root file system only, as before), setuid/setgid
+# programs and world-writable web files into SCAN_CACHE. Separate finds used
+# to walk / twice more. /usr, /var/www and /srv get their own walk only when
+# they are separate mounts. --harden never changes any of these, so the
+# re-audit reuses the results.
+scan_filesystem() {
+    [[ -z ${SCAN_CACHE[scanned]+x} ]] || return 0
+    local root_dev dir
+    local -a roots=(/)
+    root_dev=$(stat -c %d /)
+    for dir in /usr /var/www /srv; do
+        if [[ -d $dir && $(stat -c %d "$dir") != "$root_dev" ]]; then roots+=("$dir"); fi
+    done
+    # awk keeps only the lines the checks show, so a host with millions of
+    # unowned files does not fill memory.
+    local out
+    out=$(timeout 240 find "${roots[@]}" -xdev \( \
+        \( -type d -perm -0002 ! -perm -1000 -printf 'S\t%D\t%p\n' \) , \
+        \( \( -nouser -o -nogroup \) -printf 'U\t%D\t%p\n' \) , \
+        \( -type f -perm /6000 \( -path '/usr/*' -o -path '/bin/*' -o -path '/sbin/*' \) -printf 'X\t%D\t%p\n' \) , \
+        \( -type f -perm -0002 \( -path '/var/www/*' -o -path '/srv/*' \) -printf 'W\t%D\t%p\n' \) \
+        \) 2>/dev/null | awk -F'\t' -v d="$root_dev" '
+            { p = $0; sub(/^[^\t]*\t[^\t]*\t/, "", p) }
+            $1 == "S" && $2 == d && s++ < 20 { print "S\t" p }
+            $1 == "U" && $2 == d && u++ < 21 { print "U\t" p }
+            $1 == "W" && w++ < 21 { print "W\t" p }
+            $1 == "X" { x++ }
+            END { print "X\t" x + 0 }') || true
+    SCAN_CACHE[sticky]=$(awk '/^S\t/ { print substr($0, 3) }' <<<"$out")
+    SCAN_CACHE[unowned]=$(awk '/^U\t/ { print substr($0, 3) }' <<<"$out")
+    SCAN_CACHE[webww]=$(awk '/^W\t/ { print substr($0, 3) }' <<<"$out")
+    SCAN_CACHE[suid]=$(awk '/^X\t/ { print substr($0, 3) }' <<<"$out")
+    SCAN_CACHE[scanned]=1
+}
+
 audit_filesystem() {
     section "File system"
     local path max owner groups sev st mode uid gid bad=""
@@ -1375,21 +1409,13 @@ audit_filesystem() {
     if [[ -z $ww ]]; then pass high FS-001 "No world-writable files in /etc"
     else fail high FS-001 "World-writable files in /etc" "$ww" "Remove write access for others: sudo chmod o-w FILE"; fi
 
-    if [[ -z ${SCAN_CACHE[sticky]+x} ]]; then
-        SCAN_CACHE[sticky]=$(timeout 120 find / -xdev -type d -perm -0002 ! -perm -1000 2>/dev/null | head -20) || true
-    fi
+    scan_filesystem
     if [[ -z ${SCAN_CACHE[sticky]} ]]; then pass medium FS-002 "World-writable directories have the sticky bit"
     else fail medium FS-002 "World-writable directories without the sticky bit" "${SCAN_CACHE[sticky]}" "sudo chmod +t DIR (or remove world write access)."; fi
 
-    if [[ -z ${SCAN_CACHE[unowned]+x} ]]; then
-        SCAN_CACHE[unowned]=$(timeout 120 find / -xdev \( -nouser -o -nogroup \) 2>/dev/null | head -21) || true
-    fi
     if [[ -z ${SCAN_CACHE[unowned]} ]]; then pass low FS-003 "No files without an owner"
     else fail low FS-003 "Files owned by deleted users or groups" "$(head -20 <<<"${SCAN_CACHE[unowned]}")" "Give them a valid owner or delete them."; fi
 
-    if [[ -z ${SCAN_CACHE[suid]+x} ]]; then
-        SCAN_CACHE[suid]=$(find /usr /bin /sbin -xdev -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null | wc -l) || true
-    fi
     info FS-004 "${SCAN_CACHE[suid]} setuid/setgid programs"
 
     local homes=""

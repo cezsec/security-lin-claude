@@ -151,6 +151,7 @@ TOTAL_SUSPICIOUS=0
 declare -a F_LEVEL=() F_CAT=() F_MSG=()     # findings
 declare -a RECOMMENDATIONS=() WARNINGS=() SECTIONS_RUN=() STAT_ORDER=() WHITELIST_ENTRIES=()
 declare -A STATS=() SUSP_IPS=() SOURCE_DESC=() SOURCE_OK=() SOURCE_READY=() WL_CACHE=()
+declare -A GEO_CACHE=() RDNS_CACHE=()   # filled by lookup_ips
 
 # Per-section records for the HTML and JSON reports
 SECTION_CUR=""                     # section being run
@@ -563,6 +564,10 @@ journal_ok() {
 
 geoip_lookup() {
     local ip="$1" tool="geoiplookup" out
+    if [[ -n "${GEO_CACHE[$ip]+x}" ]]; then
+        printf '%s' "${GEO_CACHE[$ip]}"
+        return 0
+    fi
     [[ "$ip" == *:* ]] && tool="geoiplookup6"
     if command -v "$tool" >/dev/null 2>&1; then
         out=$(timeout 3 "$tool" "$ip" 2>/dev/null | awk -F': ' 'NR == 1 { print $2 }') || true
@@ -578,8 +583,42 @@ reverse_dns() {
         printf 'not resolved (--no-dns)'
         return 0
     fi
+    if [[ -n "${RDNS_CACHE[$ip]+x}" ]]; then
+        printf '%s' "${RDNS_CACHE[$ip]}"
+        return 0
+    fi
     out=$(timeout "$DNS_TIMEOUT" getent hosts "$ip" 2>/dev/null | awk 'NR == 1 { print $2 }') || true
     printf '%s' "${out:-N/A}"
+}
+
+# lookup_ips <ip>... — resolves location and hostname of several IPs at once,
+# 16 at a time, into GEO_CACHE/RDNS_CACHE. Attacking IPs often have no reverse
+# DNS, so looking up a top-20 list one by one could wait 20 DNS timeouts.
+lookup_ips() {
+    local dir="$WORKDIR/lookup" ip i=0 n geo rdns
+    local -a todo=() pids=()
+    for ip in "$@"; do
+        [[ -n "${GEO_CACHE[$ip]+x}" ]] || todo+=("$ip")
+    done
+    [[ ${#todo[@]} -gt 0 ]] || return 0
+    mkdir -p -- "$dir"
+    for ip in "${todo[@]}"; do
+        ( printf '%s\t%s\n' "$(geoip_lookup "$ip")" "$(reverse_dns "$ip")" > "$dir/$i" ) &
+        pids+=("$!")
+        i=$((i + 1))
+        if [[ ${#pids[@]} -ge 16 ]]; then
+            wait "${pids[@]}" || true
+            pids=()
+        fi
+    done
+    [[ ${#pids[@]} -eq 0 ]] || wait "${pids[@]}" || true
+    for ((n = 0; n < i; n++)); do
+        geo="" rdns=""
+        [[ -f "$dir/$n" ]] && IFS="$TAB" read -r geo rdns < "$dir/$n"
+        GEO_CACHE[${todo[n]}]="${geo:-Unknown}"
+        RDNS_CACHE[${todo[n]}]="${rdns:-N/A}"
+    done
+    rm -rf -- "$dir"
 }
 
 section_enabled() {
@@ -1753,6 +1792,15 @@ section_bruteforce() {
         banned[$ip]=1
     done < <(awk -F'\t' '$1 == "BAN" { print $3 }' "$WORKDIR/f2b.events")
 
+    # Look up the IPs that will be shown in one parallel batch
+    local -a shown_ips=()
+    while IFS="$TAB" read -r ip _; do
+        is_whitelisted "$ip" && continue
+        shown_ips+=("$ip")
+        [[ ${#shown_ips[@]} -lt "$TOP_N" ]] || break
+    done < <(awk -F'\t' -v t="$ALERT_THRESHOLD" '$2 >= t' "$WORKDIR/ssh.ips")
+    lookup_ips "${shown_ips[@]}"
+
     local total=0 shown=0 unbanned=0 score acc du first last geo rdns status
     while IFS="$TAB" read -r ip score acc du first last; do
         if is_whitelisted "$ip"; then
@@ -2879,6 +2927,9 @@ section_packages() {
         local label
         if [[ "$DEEP_SCAN" -eq 1 ]]; then
             label="all packages"
+            while IFS= read -r t; do
+                verify+=("$t")
+            done < <(dpkg-query -W -f '${db:Status-Abbrev}\t${binary:Package}\n' 2>/dev/null | awk '$1 ~ /^.[^nc]/ { print $2 }')
         else
             local -a core=()
             IFS=' ' read -r -a core <<< "$CORE_PKGS"
@@ -2887,8 +2938,14 @@ section_packages() {
             done < <(dpkg-query -W -f '${db:Status-Abbrev}\t${Package}\n' "${core[@]}" 2>/dev/null | awk '$1 ~ /^ii/ { print $2 }')
             label="${#verify[@]} core packages (all with --deep)"
         fi
-        if [[ "$DEEP_SCAN" -eq 1 || ${#verify[@]} -gt 0 ]]; then
-            timeout 900 dpkg -V "${verify[@]}" 2>/dev/null > "$WORKDIR/dpkg.verify" || true
+        if [[ ${#verify[@]} -gt 0 ]]; then
+            # Parallel batches print the same lines as one "dpkg -V" in about
+            # half the time; at most 4 jobs so a spinning disk is not thrashed
+            local jobs
+            jobs=$(nproc 2>/dev/null) || jobs=1
+            [[ "$jobs" -le 4 ]] || jobs=4
+            printf '%s\n' "${verify[@]}" |
+                timeout 900 xargs -r -P "$jobs" -n 8 dpkg -V 2>/dev/null > "$WORKDIR/dpkg.verify" || true
         else
             : > "$WORKDIR/dpkg.verify"
         fi
@@ -4056,7 +4113,7 @@ section_filesystem() {
     fi
     local owners="$WORKDIR/owners.tsv"
     {
-        for row in "${suid[@]}"; do printf '%s\n' "${row##*$TAB}"; done
+        for row in "${suid[@]}"; do printf '%s\n' "${row##*"$TAB"}"; done
         cut -f1 "$caps"
     } | sort -u | pkg_owners > "$owners"
     local -A pkgof=()

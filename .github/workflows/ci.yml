@@ -1,0 +1,17 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # secmon.sh has known warning-level false positives (variables reused
+      # across functions), so CI fails on errors only.
+      - name: shellcheck
+        run: shellcheck -S error harden.sh secmon.sh linux_persistence_hunter.sh tests/smoke.sh
+      - name: smoke tests
+        run: bash tests/smoke.sh
